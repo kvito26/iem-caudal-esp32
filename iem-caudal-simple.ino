@@ -16,7 +16,7 @@
 #define NIVEL 14 //pin de entrada nivel
 #define CAUDAL 5 //pin de entrada para el caudalimetro 
 //Para el Caudalimetro
-#define VOL_PULSOS 0.5f
+#define VOL_PULSOS 0.4931f
 #define PULSOS 75.0f
 #define TIEMPO_ACTUALIZAR_CAUDAL 850 //[ms]
 //Para el Nivel de Agua
