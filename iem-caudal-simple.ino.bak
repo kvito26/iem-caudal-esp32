@@ -1,0 +1,740 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+//=========================================================
+//DEFINICION DE LOS PINES
+//Pines para el encoder rotatorio
+#define CLK 4
+#define DT 16
+#define SW 17 //pin de entrada
+//Pines de salida de la maquina
+#define VERDE 25
+#define ROJO 26
+#define BOMBA 32
+#define VENT 33
+#define NIVEL 14 //pin de entrada nivel
+//Para el display LCD
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+//=========================================================
+//VARIABLES GLOBALES
+//Para el encoder rotatorio
+bool estadoActualCLK = false;
+bool estadoUltimoCLK = false;
+volatile int hora = 0, minuto = 0, segundo = 0;
+volatile int hora_inicial = 0, minuto_inicial = 0, segundo_inicial = 0;
+//Para el boton del encoder rotatorio
+bool botonPresionado = false;
+bool botonPresionadoLargo = false;
+bool botonPresionadoDoble = false;
+//const int BOTON_DEBOUNCE = 50; //ms, por el momento no esta usado
+const int PRESIONADO_LARGO = 1000; //ms
+const int LIM_ENTRE_DOBLE_PRES = 350; //ms
+uint32_t botonPresInicio = 0;
+uint32_t botonTiempoPres = 0;
+uint32_t botonPresFinal = 0;
+uint32_t botonTiempoEntrePres = 0;
+//Variables globales para el sistema
+volatile bool estadoSistema = false;
+volatile int pantallaAnterior;
+volatile bool pantallas[6] = {false};
+volatile int tamagnoPantallas = (int) (sizeof(pantallas) / sizeof(pantallas[0]));
+
+//=========================================================
+//FREERTOS	
+//********************************************************
+//Handle de los Temporizadores 
+TimerHandle_t ParpadeoVerdeTimer = NULL;
+TimerHandle_t CuentaRegresivaTimer = NULL;
+TimerHandle_t ParpadeoPausaFinTimer = NULL;
+
+//********************************************************
+//Handle de Semaforos 
+SemaphoreHandle_t EstadoSistemaMutex = NULL;
+SemaphoreHandle_t ArrayPantallasMutex = NULL;
+SemaphoreHandle_t HoraMinSegMutex = NULL;
+
+//********************************************************
+//Handle de las Tareas
+TaskHandle_t EncoderRotatorioTaskHandle = NULL;
+TaskHandle_t EncoderBotonTaskHandle = NULL;
+TaskHandle_t PulsacionCortaTaskHandle = NULL;
+TaskHandle_t PulsacionLargaTaskHandle = NULL;
+TaskHandle_t ServidorGraficoTaskHandle = NULL;
+TaskHandle_t CompositorGraficoTaskHandle = NULL;
+TaskHandle_t CuentaRegresivaTaskHandle = NULL;
+
+//********************************************************
+//Tareas FreeRTOS
+//Tarea 1. Encoder Rotatorio
+void EncoderRotatorioTask(void *parameter){
+	for (;;){
+		estadoActualCLK = digitalRead(CLK) ? true : false;
+
+		if ((estadoActualCLK != estadoUltimoCLK) && estadoActualCLK == false){
+			bool estadoDT = digitalRead(DT) ? true : false;
+			//Horario
+			if (estadoDT == true){
+				minuto++; 
+				if (minuto > 59){
+					minuto = 0;
+					hora++;
+					if (hora > 23) hora = 0;
+				}
+			}
+			//Antihorario
+			else{
+				minuto--;
+				if (minuto < 0){
+					minuto = 59;
+					hora--;
+					if (hora < 0) hora = 23;
+				}
+			}
+			//Actualizar Pantalla
+			xTaskNotifyGive(CompositorGraficoTaskHandle);
+
+			Serial.printf("hora: %d\n", hora);
+			Serial.printf("Minuto: %d\n", minuto);
+		}
+		estadoUltimoCLK = estadoActualCLK;
+
+		vTaskDelay(2 / portTICK_PERIOD_MS);
+	}
+}
+
+//Tarea 2. Boton del Encoder Rotatorio
+void EncoderBotonTask(void *parameter){
+	for (;;){
+		bool estadoBotonReal = digitalRead(SW) ? false : true; //ya que es pullup
+
+		//detectando flando de bajada
+		if (estadoBotonReal && !botonPresionado){
+			botonPresionado = true;
+			botonPresInicio = millis();
+			botonPresionadoLargo = false;
+			botonPresionadoDoble = false;
+		}
+
+		//detectando pulsacion larga
+		botonTiempoPres = millis() - botonPresInicio;
+		if (estadoBotonReal && botonPresionado && !botonPresionadoLargo && (botonTiempoPres > PRESIONADO_LARGO)){
+			botonPresionadoLargo = true;
+			xTaskNotifyGive(PulsacionLargaTaskHandle);
+		}
+
+		//detectando flando de subida
+		if (!estadoBotonReal && botonPresionado){
+			botonPresionado = false;
+			botonPresFinal = millis();
+			botonTiempoEntrePres = millis() - botonPresFinal;
+			while (botonTiempoEntrePres <= LIM_ENTRE_DOBLE_PRES){
+				//detectando flanco de bajada para la segunda pulsacion
+				estadoBotonReal = digitalRead(SW) ? false : true; //ya que es pullup
+
+				//detectando flando de bajada
+				if (estadoBotonReal && !botonPresionado){
+					botonPresionado = true;
+					botonPresInicio = millis();
+				}
+				if (!estadoBotonReal && botonPresionado){
+					botonPresionado = false;
+					botonPresionadoDoble = true;
+					Serial.println("Pulsacion DOBLE");
+					break; //saliendo del bucle while
+				}
+
+				botonTiempoEntrePres = millis() - botonPresFinal;
+				vTaskDelay(2 / portTICK_PERIOD_MS);
+			}
+
+			if (!botonPresionadoLargo && !botonPresionadoDoble){
+				xTaskNotifyGive(PulsacionCortaTaskHandle);
+			}
+		}
+
+		vTaskDelay(2 / portTICK_PERIOD_MS);
+	}
+}
+ 
+//Tarea 3. Pulsacion Corta
+void PulsacionCortaTask(void *parameter){
+	for(;;){
+		//Espera infinita la notificacion de la pulsacion corta
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		Serial.println("Pulsacion CORTA");
+
+		int indicePantalla = -1;
+		//verificacion de la pantalla en la que estamos
+		if (xSemaphoreTake(ArrayPantallasMutex, pdMS_TO_TICKS(10)) == pdTRUE){
+			for (int i = 0; i < tamagnoPantallas; i++){
+				if (pantallas[i] == true){
+					indicePantalla = i;
+					continue;
+				}
+			}
+
+			xSemaphoreGive(ArrayPantallasMutex);
+		}
+
+		switch (indicePantalla){
+			case 1: //ajustar tiempo
+				iniciarSistema();	
+				if (xSemaphoreTake(ArrayPantallasMutex, pdMS_TO_TICKS(10)) == pdTRUE){
+					intercambioRoles(pantallas, tamagnoPantallas, indicePantalla+1);
+					xSemaphoreGive(ArrayPantallasMutex);
+				}
+				//detener la tarea del encoder rotatorio (perilla)
+				vTaskSuspend(EncoderRotatorioTaskHandle);
+				//actualizar pantalla
+				xTaskNotifyGive(ServidorGraficoTaskHandle);
+				vTaskDelay(5 / portTICK_PERIOD_MS); //esperar un tiempo y actualizar los numeros de inicio
+				xTaskNotifyGive(CompositorGraficoTaskHandle); 
+				//iniciar el temporizador 
+				xTimerStart(CuentaRegresivaTimer, 1000);
+				xTimerStop(ParpadeoVerdeTimer, 0); //0: tiempo de espera para el stop (redundante)
+				break;
+
+			case 2: //sistema en funcionamiento
+				pausarSistema();
+				if (xSemaphoreTake(ArrayPantallasMutex, pdMS_TO_TICKS(10)) == pdTRUE){
+					intercambioRoles(pantallas, tamagnoPantallas, indicePantalla+1);
+					xSemaphoreGive(ArrayPantallasMutex);
+				}
+				//actualizar pantalla
+				xTaskNotifyGive(ServidorGraficoTaskHandle);
+				//Iniciar el Timer de Parpadeo
+				xTimerStart(ParpadeoVerdeTimer, 0); //0: tiempo de espera para el inicio
+				//Detener el Timer de Cuenta Regresiva
+				xTimerStop(CuentaRegresivaTimer, 0);
+				break;
+
+			case 3: //sistema en pausa
+				iniciarSistema();	
+				if (xSemaphoreTake(ArrayPantallasMutex, pdMS_TO_TICKS(10)) == pdTRUE){
+					intercambioRoles(pantallas, tamagnoPantallas, 2);
+					xSemaphoreGive(ArrayPantallasMutex);
+				}
+				//actualizar pantalla
+				xTaskNotifyGive(ServidorGraficoTaskHandle);
+				vTaskDelay(5 / portTICK_PERIOD_MS); //esperar un tiempo y actualizar los numeros de inicio
+				xTaskNotifyGive(CompositorGraficoTaskHandle); 
+				//iniciar el temporizador 
+				xTimerStart(CuentaRegresivaTimer, 0);
+				xTimerStop(ParpadeoVerdeTimer, 0); //0: tiempo de espera para el stop (redundante)
+				
+				break;
+
+			case 4: //funcionamiento finalizado
+				if (xSemaphoreTake(ArrayPantallasMutex, pdMS_TO_TICKS(10)) == pdTRUE){
+					intercambioRoles(pantallas, tamagnoPantallas, 1);
+					xSemaphoreGive(ArrayPantallasMutex);
+				}
+				//detener la tarea del encoder rotatorio (perilla)
+				vTaskResume(EncoderRotatorioTaskHandle);
+				//actualizar pantalla
+				xTaskNotifyGive(ServidorGraficoTaskHandle);
+				
+				break;
+		}
+
+		vTaskDelay(2 / portTICK_PERIOD_MS);
+	}
+}
+
+//Tarea 4. Pulsacion Larga
+void PulsacionLargaTask(void *parameter){
+	for(;;){
+		//Espera infinita la notificacion de la pulsacion larga
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		Serial.println("Pulsacion LARGA");
+
+		int indicePantalla = -1;
+		//verificacion de la pantalla en la que estamos
+		if (xSemaphoreTake(ArrayPantallasMutex, pdMS_TO_TICKS(10)) == pdTRUE){
+			for (int i = 0; i < tamagnoPantallas; i++){
+				if (pantallas[i] == true){
+					indicePantalla = i;
+					continue;
+				}
+			}
+
+			xSemaphoreGive(ArrayPantallasMutex);
+		}
+
+		switch (indicePantalla){
+			case 1:
+				//reinicio de valores
+				reiniciarValoresHMS();
+				//actualizar valores en el Compositor Grafico
+				xTaskNotifyGive(CompositorGraficoTaskHandle);
+				break;
+			//el mismo funcionamiento para todos los casos
+			case 2: case 3: case 4: //en funcionamiento, pausa, finalizado
+				detenerSistema();
+				reiniciarValoresHMS();
+				if (xSemaphoreTake(ArrayPantallasMutex, pdMS_TO_TICKS(10)) == pdTRUE){
+					intercambioRoles(pantallas, tamagnoPantallas, 1);
+					xSemaphoreGive(ArrayPantallasMutex);
+				}
+				//reanudar la tarea de encoder rotatorio (perilla)
+				vTaskResume(EncoderRotatorioTaskHandle);
+				//actualizar pantalla
+				xTaskNotifyGive(ServidorGraficoTaskHandle);
+				//detener los timers de parpadeo verde (redundante) y el de cuenta regresiva
+				xTimerStop(ParpadeoVerdeTimer, 0);
+				xTimerStop(CuentaRegresivaTimer, 0);
+				break;
+		}
+
+		vTaskDelay(2 / portTICK_PERIOD_MS);
+	}
+}
+
+//Tarea 5. Servidor Grafico
+void ServidorGraficoTask(void *parameter){
+	for (;;){
+		//Espera infita para actualizar una pantalla
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+		int indicePantalla = -1;
+		//verificacion de la pantalla en la que estamos y actulizar
+		if (xSemaphoreTake(ArrayPantallasMutex, pdMS_TO_TICKS(10)) == pdTRUE){
+			for (int i = 0; i < tamagnoPantallas; i++){
+				if (pantallas[i] == true){
+					indicePantalla = i;
+					continue;
+				}
+			}
+
+			xSemaphoreGive(ArrayPantallasMutex);
+		}
+		Serial.printf("Dentro del Servidor Grafico | Pantalla: %d\n", indicePantalla);
+		gestorPantallas(indicePantalla); //de lo contrario mostrar la pantalla correspondiente
+		
+		vTaskDelay(2 / portTICK_PERIOD_MS);
+	}
+}
+
+//Tarea 6. Compositor Grafico | Para las animaciones en los numeros
+void CompositorGraficoTask(void *parameter){
+	for (;;){
+		//Espera infinita para ciertas actualizaciones de pantalla
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+		int indicePantalla = -1;
+		//verificacion de la pantalla en la que estamos y actulizar
+		if (xSemaphoreTake(ArrayPantallasMutex, pdMS_TO_TICKS(10)) == pdTRUE){
+			for (int i = 0; i < tamagnoPantallas; i++){
+				if (pantallas[i] == true){
+					indicePantalla = i;
+					continue;
+				}
+			}
+
+			xSemaphoreGive(ArrayPantallasMutex);
+		}
+
+		//Variables locales rapidas	
+		int horaLocalComp, minLocalComp, segLocalComp;
+		if (xSemaphoreTake(HoraMinSegMutex, pdMS_TO_TICKS(5)) == pdTRUE){
+			horaLocalComp = hora;	
+			minLocalComp = minuto;
+			segLocalComp = segundo;
+			
+			xSemaphoreGive(HoraMinSegMutex);
+		}
+		Serial.printf("Dentro del Compositor Grafico | Pantalla: %d\n", indicePantalla);
+		dibujarCaracteristicas(horaLocalComp, minLocalComp, segLocalComp, indicePantalla);
+
+		vTaskDelay(1 / portTICK_PERIOD_MS);
+	}
+}
+
+//Tarea 7. Cuenta Regresiva
+void CuentaRegresivaTask(void *parameter){
+	for (;;){
+		//Esta tarea solo puede esperar un poco mas de un segundo 
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+		int hora_LocalCR, minuto_LocalCR, segundo_LocalCR;
+		if (xSemaphoreTake(HoraMinSegMutex, pdMS_TO_TICKS(100)) == pdTRUE){
+			hora_LocalCR = hora;	
+			minuto_LocalCR = minuto;
+			segundo_LocalCR = segundo;
+			
+			xSemaphoreGive(HoraMinSegMutex);
+		}
+
+		//proceso de decremento del tiempo
+		segundo_LocalCR--;
+		if (segundo_LocalCR < 0){
+			segundo_LocalCR = 59;
+			minuto_LocalCR--;
+			if (minuto_LocalCR < 0){
+				minuto_LocalCR = 59;
+				hora_LocalCR--;
+			}
+		}
+
+		//verificar que el tiempo haya concluido (todos en 0)
+		if (segundo_LocalCR == 0 && minuto_LocalCR == 0 && hora_LocalCR == 0){
+			//al finalizar el conteo regresivo
+			xTimerStop(CuentaRegresivaTimer, 0);
+			detenerSistema();
+			reiniciarValoresHMS();
+			//cambiar indice a Finalizado y Notificar
+			if (xSemaphoreTake(ArrayPantallasMutex, pdMS_TO_TICKS(10)) == pdTRUE){
+				intercambioRoles(pantallas, tamagnoPantallas, 4);
+				xSemaphoreGive(ArrayPantallasMutex);
+			}
+			xTaskNotifyGive(ServidorGraficoTaskHandle);
+		}
+		else { //copiar los valores locales a los globales y notificar al Compositor Grafico
+			if (xSemaphoreTake(HoraMinSegMutex, pdMS_TO_TICKS(100)) == pdTRUE){
+				hora = hora_LocalCR;
+				minuto = minuto_LocalCR;
+				segundo = segundo_LocalCR;
+				
+				xSemaphoreGive(HoraMinSegMutex);
+			}
+			xTaskNotifyGive(CompositorGraficoTaskHandle);
+		}
+
+		vTaskDelay(100 / portTICK_PERIOD_MS);
+	}
+}
+
+//=========================================================
+void setup() {
+	Serial.begin(115200);
+	//********************************************************
+	//Inicio para el LCD
+	lcd.init();
+	lcd.backlight();
+
+	//********************************************************
+	//Configuracion de los pines de entrada
+	pinMode(CLK, INPUT_PULLUP);
+	pinMode(DT, INPUT_PULLUP);
+	pinMode(SW, INPUT_PULLUP);
+	//Configuracion de los pines de salida
+	pinMode(VERDE, OUTPUT);
+	pinMode(ROJO, OUTPUT);
+	pinMode(BOMBA, OUTPUT);
+	pinMode(VENT, OUTPUT);
+	pinMode(NIVEL, INPUT); //pin de entrada para el nivel de agua
+
+	//********************************************************
+	//Para el encoder rotatorio | Asignar el ultimo estado de CLK
+	estadoUltimoCLK = digitalRead(CLK) ? true : false;
+	
+	//********************************************************
+	//Creacion de los Semaforos
+	EstadoSistemaMutex = xSemaphoreCreateMutex();
+	ArrayPantallasMutex = xSemaphoreCreateMutex();
+	HoraMinSegMutex = xSemaphoreCreateMutex();
+
+	//Creacion de Timers
+	//Timer 1. Parpadeo de Piloto Verde en estado de Pausa
+	ParpadeoVerdeTimer = xTimerCreate(
+		"ParpadeoVerdeTimer", //nombre del timer
+		pdMS_TO_TICKS(700), //periodo de parpadeo
+		pdTRUE, //autoreload, timer periodico
+		NULL, //sin ID
+		parpadeoVerde //funcion callback
+	);
+
+	//Timer 2. Cuenta regresiva 
+	CuentaRegresivaTimer = xTimerCreate(
+		"CuentaRegresivaTimer", //nombre del timer
+		pdMS_TO_TICKS(1000), //periodo de parpadeo
+		pdTRUE, //autoreload, timer periodico
+		NULL, //sin ID
+		cuentaRegresiva //funcion callback
+	);
+	
+	//Timer 3. Parpadeo de Pantalla Pausa-Fin
+	ParpadeoPausaFinTimer = xTimerCreate(
+		"ParpadeoPausaFinTimer", //nombre del timer
+		pdMS_TO_TICKS(700), //periodo de parpadeo
+		pdTRUE, //autoreload, timer periodico
+		NULL, //sin ID
+		parpadeoPausaFin//funcion callback
+	);
+
+
+	//Creacion de las Tareas
+	//Tarea 1. Encoder Rotatorio
+	xTaskCreatePinnedToCore(
+		EncoderRotatorioTask, 
+		"EncoderRotatorioTask",
+		4096, //memoria en el stack
+		NULL,
+		1, //prioridad
+		&EncoderRotatorioTaskHandle,
+		1 //nucleo en el procesador
+	);
+
+	//Tarea 2. Boton del Encoder Rotatorio
+	xTaskCreatePinnedToCore(
+		EncoderBotonTask, 
+		"EncoderBotonTask",
+		4096, //memoria en el stack
+		NULL,
+		1, //prioridad
+		&EncoderBotonTaskHandle,
+		1 //nucleo en el procesador
+	);
+
+	//Tarea 3. Pulsacion Corta
+	xTaskCreatePinnedToCore(
+		PulsacionCortaTask, 
+		"PulsacionCortaTask",
+		2048, //memoria en el stack
+		NULL,
+		1, //prioridad
+		&PulsacionCortaTaskHandle,
+		1 //nucleo en el procesador
+	);
+
+	//Tarea 4. Pulsacion Larga
+	xTaskCreatePinnedToCore(
+		PulsacionLargaTask, 
+		"PulsacionLargaTask",
+		2048, //memoria en el stack
+		NULL,
+		1, //prioridad
+		&PulsacionLargaTaskHandle,
+		1 //nucleo en el procesador
+	);
+
+	//Tarea 5. Servidor Grafico
+	xTaskCreatePinnedToCore(
+		ServidorGraficoTask, 
+		"ServidorGraficoTask",
+		4096, //memoria en el stack
+		NULL,
+		1, //prioridad
+		&ServidorGraficoTaskHandle,
+		0 //nucleo en el procesador
+	);
+
+	//Tarea 6. Compositor Grafico | Para las animaciones en los numeros
+	xTaskCreatePinnedToCore(
+		CompositorGraficoTask, 
+		"CompositorGraficoTask",
+		4096, //memoria en el stack
+		NULL,
+		1, //prioridad
+		&CompositorGraficoTaskHandle,
+		0 //nucleo en el procesador
+	);
+
+	//Tarea 7. Cuenta Regresiva
+	xTaskCreatePinnedToCore(
+		CuentaRegresivaTask, 
+		"CuentaRegresivaTask",
+		4096, //memoria en el stack
+		NULL,
+		1, //prioridad
+		&CuentaRegresivaTaskHandle,
+		0 //nucleo en el procesador
+	);
+
+	//********************************************************
+	//Iniciando Sistema
+	gestorPantallas(0);
+	vTaskDelay(800 / portTICK_PERIOD_MS);
+	gestorPantallas(1);
+	vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+	Serial.println("Sistema iniciado");
+}
+
+//=========================================================
+void loop() {
+}
+
+//=========================================================
+//FUNCIONES
+//********************************************************
+//Para la Gestion de Pantallas
+void gestorPantallas(int pantalla){
+	lcd.clear();
+	if (xSemaphoreTake(ArrayPantallasMutex, pdMS_TO_TICKS(10)) == pdTRUE){
+		intercambioRoles(pantallas, tamagnoPantallas, pantalla);
+		xSemaphoreGive(ArrayPantallasMutex);
+	}
+	switch (pantalla){
+		case 0: //bienvenida
+			lcd.setCursor(3, 0);
+			lcd.print("BIENVENIDO");
+			lcd.setCursor(4, 1);
+			lcd.print("IEM-UMSA");
+			break;
+
+		case 1: //ajustar tiempo
+			lcd.setCursor(1, 0);
+			lcd.print("AJUSTAR TIEMPO");
+			lcd.setCursor(1, 1);
+			lcd.print("> 00:00:00");
+			break;
+
+		case 2: //en funcionaiento
+			lcd.setCursor(0, 0);
+			lcd.print("VOL.:");
+			lcd.setCursor(0, 1);
+			lcd.print("TIEMPO: 00:00:00");
+			break;
+
+		case 3: //en pausa
+			lcd.setCursor(0, 0);
+			lcd.print("EN PAUSA");	
+			break;
+
+		case 4: //finalizado
+			lcd.setCursor(0, 0);
+			lcd.print("FINALIZADO");	
+			break;
+
+		case 5: //nivel de agua bajo
+			lcd.setCursor(0, 0);
+			lcd.print("NIVEL BAJO");
+			break;
+	}
+}
+
+//Dibujar ciertas caracteristicas en pantalla
+void dibujarCaracteristicas(int hora, int minuto, int segundo, int pantalla){
+	switch (pantalla){
+		case 1:
+			//para mostrar la hora
+			if (0 <= hora && hora <= 9){
+				lcd.setCursor(3, 1);
+				lcd.print("0");
+				lcd.setCursor(4, 1);	
+				lcd.print(hora);
+			}
+			else {
+				lcd.setCursor(3, 1);
+				lcd.print(hora);
+			}
+
+			//para mostrar los minutos
+			if (0 <= minuto && minuto <= 9){
+				lcd.setCursor(6, 1);
+				lcd.print("0");
+				lcd.setCursor(7, 1);	
+				lcd.print(minuto);
+			}
+			else {
+				lcd.setCursor(6, 1);
+				lcd.print(minuto);
+			}
+			break;
+
+		case 2:
+			//para mostrar la hora
+			if (0 <= hora && hora <= 9){
+				lcd.setCursor(8, 1);
+				lcd.print("0");
+				lcd.setCursor(9, 1);	
+				lcd.print(hora);
+			}
+			else {
+				lcd.setCursor(8, 1);
+				lcd.print(hora);
+			}
+
+			//para mostrar los minutos
+			if (0 <= minuto && minuto <= 9){
+				lcd.setCursor(11, 1);
+				lcd.print("0");
+				lcd.setCursor(12, 1);	
+				lcd.print(minuto);
+			}
+			else {
+				lcd.setCursor(11, 1);
+				lcd.print(minuto);
+			}
+
+			//para mostrar los segundos
+			if (0 <= segundo && segundo <= 9){
+				lcd.setCursor(14, 1);
+				lcd.print("0");
+				lcd.setCursor(15, 1);	
+				lcd.print(segundo);
+			}
+			else {
+				lcd.setCursor(14, 1);
+				lcd.print(segundo);
+			}
+			break;	
+	}
+}
+
+//********************************************************
+//Funcion para cambio de roles
+void intercambioRoles(volatile bool arreglo[], volatile int tamagno_arreglo, int indice){
+	if (0 <= indice && indice < tamagno_arreglo){
+		for (int i = 0; i < tamagno_arreglo; i++){
+			arreglo[i] = false;
+		}
+		arreglo[indice] = true;
+	}
+}
+
+//********************************************************
+//Funcion de Reinicio de Valores de Hora, Minuto y Segundo
+void reiniciarValoresHMS(){
+	if (xSemaphoreTake(HoraMinSegMutex, pdMS_TO_TICKS(100)) == pdTRUE){
+		hora = minuto = segundo = 0;
+
+		xSemaphoreGive(HoraMinSegMutex);
+	}
+}
+
+//********************************************************
+//Acciones del Sistema
+void iniciarSistema(){
+	digitalWrite(VERDE, HIGH);
+	digitalWrite(BOMBA, HIGH);
+	digitalWrite(VENT, HIGH);
+}
+
+void pausarSistema(){
+	digitalWrite(BOMBA, LOW);
+	digitalWrite(VENT, LOW);
+}
+
+void detenerSistema(){
+	digitalWrite(VERDE, LOW);
+	digitalWrite(BOMBA, LOW);
+	digitalWrite(VENT, LOW);
+}
+
+void alertaSistema(){
+	digitalWrite(ROJO, HIGH);
+}
+
+//********************************************************
+//Funciones Callback para los Timers
+//Parpadeo de Piloto Verde en estado de Pausa del Sistema
+void parpadeoVerde(TimerHandle_t xTimer){
+	static bool estado = true; //ya que el piloto se encontraba encendido 
+	estado = !estado;
+	digitalWrite(VERDE, estado);
+}
+
+//Parpadeo de Pantalla en Estados de Pausa y Fin de funcionamiento
+void parpadeoPausaFin(TimerHandle_t xTimer){
+
+}
+
+//Cuenta regresiva en el funcionamiento del sistema
+void cuentaRegresiva(TimerHandle_t xTimer){
+	xTaskNotifyGive(CuentaRegresivaTaskHandle);
+}
+
+
